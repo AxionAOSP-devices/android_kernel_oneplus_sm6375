@@ -24,6 +24,8 @@
 
 #include <trace/events/sched.h>
 #include <trace/hooks/sched.h>
+#include <trace/hooks/bore.h>
+#include <trace/hooks/latency.h>
 
 #include "walt/walt.h"
 
@@ -767,6 +769,8 @@ void init_entity_runnable_average(struct sched_entity *se)
 		sa->runnable_load_avg = sa->load_avg = scale_load_down(se->load.weight);
 
 	se->runnable_weight = se->load.weight;
+	trace_android_vh_bore_init_entity(se);
+	trace_android_vh_latency_init_entity(se);
 
 	/* when this task enqueue'ed, it will contribute to its cfs_rq's load_avg */
 }
@@ -840,6 +844,8 @@ void post_init_entity_util_avg(struct task_struct *p)
 #else /* !CONFIG_SMP */
 void init_entity_runnable_average(struct sched_entity *se)
 {
+	trace_android_vh_bore_init_entity(se);
+	trace_android_vh_latency_init_entity(se);
 }
 void post_init_entity_util_avg(struct task_struct *p)
 {
@@ -878,10 +884,15 @@ static void update_curr(struct cfs_rq *cfs_rq)
 
 	if (entity_is_task(curr)) {
 		struct task_struct *curtask = task_of(curr);
+		int new_prio = -1;
 
 		trace_sched_stat_runtime(curtask, delta_exec, curr->vruntime);
 		cgroup_account_cputime(curtask, delta_exec);
 		account_group_exec_runtime(curtask, delta_exec);
+
+		trace_android_vh_bore_update_curr(curtask, delta_exec, &new_prio);
+		if (new_prio >= 0)
+			reweight_task(curtask, new_prio);
 	}
 
 	account_cfs_rq_runtime(cfs_rq, delta_exec);
@@ -2931,13 +2942,17 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 void reweight_task(struct task_struct *p, int prio)
 {
 	struct sched_entity *se = &p->se;
-	struct cfs_rq *cfs_rq = cfs_rq_of(se);
-	struct load_weight *load = &se->load;
 	unsigned long weight = scale_load(sched_prio_to_weight[prio]);
 
-	reweight_entity(cfs_rq, se, weight, weight);
-	load->inv_weight = sched_prio_to_wmult[prio];
+	if (se->on_rq) {
+		struct cfs_rq *cfs_rq = cfs_rq_of(se);
+		reweight_entity(cfs_rq, se, weight, weight);
+	} else {
+		se->load.weight = weight;
+	}
+	se->load.inv_weight = sched_prio_to_wmult[prio];
 }
+EXPORT_SYMBOL_GPL(reweight_task);
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 #ifdef CONFIG_SMP
@@ -4407,8 +4422,12 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 	se = __pick_first_entity(cfs_rq);
 	delta = curr->vruntime - se->vruntime;
 
-	if (delta < 0)
-		return;
+	{
+		s64 offset = 0;
+		trace_android_vh_latency_tick_offset(curr, se, &offset);
+		if (delta < offset)
+			return;
+	}
 
 	if (delta > ideal_runtime)
 		resched_curr(rq_of(cfs_rq));
@@ -4445,6 +4464,7 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	}
 
 	se->prev_sum_exec_runtime = se->sum_exec_runtime;
+	trace_android_vh_bore_set_next_entity(se);
 }
 
 static int
@@ -5699,6 +5719,9 @@ dequeue_throttle:
 
 	util_est_dequeue(&rq->cfs, p, task_sleep);
 	hrtick_update(rq);
+
+	if (task_sleep)
+		trace_android_vh_bore_dequeue_task_fair(p, flags);
 }
 
 #ifdef CONFIG_SMP
@@ -7638,11 +7661,14 @@ static int
 wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se)
 {
 	s64 gran, vdiff = curr->vruntime - se->vruntime;
+	s64 offset = 0;
 
-	if (vdiff <= 0)
+	trace_android_vh_latency_wakeup_offset(curr, se, &offset);
+
+	if (vdiff < offset)
 		return -1;
 
-	gran = wakeup_gran(se);
+	gran = offset + wakeup_gran(se);
 	if (vdiff > gran)
 		return 1;
 
@@ -7957,6 +7983,7 @@ static void yield_task_fair(struct rq *rq)
 	}
 
 	set_skip_buddy(se);
+	trace_android_vh_bore_yield_task_fair(curr);
 }
 
 static bool yield_to_task_fair(struct rq *rq, struct task_struct *p, bool preempt)
@@ -11786,6 +11813,7 @@ static void task_fork_fair(struct task_struct *p)
 	}
 
 	se->vruntime -= cfs_rq->min_vruntime;
+	trace_android_vh_bore_task_fork(p);
 	rq_unlock(rq, &rf);
 }
 
